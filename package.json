@@ -1,0 +1,20 @@
+{
+  "name": "agency-deal-sourcer-v2",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "Agency Deal Sourcer v2 - Trigger.dev powered prospect discovery and enrichment",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.71.2",
+    "@trigger.dev/sdk": "4.3.3",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@trigger.dev/build": "4.3.3"
+  }
+}
