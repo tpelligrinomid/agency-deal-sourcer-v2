@@ -103,7 +103,7 @@ interface OceanPeopleSearchResponse {
 }
 
 async function fetchPeople(apiToken: string, body: Record<string, any>): Promise<OceanPerson[]> {
-  const response = await fetch(`${OCEAN_BASE_URL}/search/people?apiToken=${apiToken}`, {
+  const response = await fetch(`https://api.ocean.io/v3/search/people?apiToken=${apiToken}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
