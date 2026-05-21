@@ -20,14 +20,14 @@ export type SearchStatus = z.infer<typeof SearchStatusSchema>;
 export const ScoringConfigSchema = z.object({
   revenue: z.object({
     min: z.number().default(750000),
-    max: z.number().default(4000000),
-    idealMin: z.number().default(1000000),
-    idealMax: z.number().default(2500000),
+    max: z.number().default(15000000),
+    idealMin: z.number().default(2500000),
+    idealMax: z.number().default(7000000),
     weight: z.number().default(0.25),
   }).optional(),
   teamSize: z.object({
-    max: z.number().default(25),
-    idealMax: z.number().default(15),
+    max: z.number().default(75),
+    idealMax: z.number().default(40),
     weight: z.number().default(0.15),
   }).optional(),
   specialization: z.object({

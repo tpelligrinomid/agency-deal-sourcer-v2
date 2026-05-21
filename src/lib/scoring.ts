@@ -5,14 +5,14 @@ import type { ScoringConfig } from "../types/inputs";
 const DEFAULT_CONFIG = {
   revenue: {
     min: 750000,
-    max: 4000000,
-    idealMin: 1000000,
-    idealMax: 2500000,
+    max: 15000000,
+    idealMin: 2500000,
+    idealMax: 7000000,
     weight: 0.25,
   },
   teamSize: {
-    max: 25,
-    idealMax: 15,
+    max: 75,
+    idealMax: 40,
     weight: 0.15,
   },
   specialization: {
@@ -85,8 +85,19 @@ function scoreRevenue(
     return 70;
   }
 
-  signals.push(`Revenue: $${(revenue / 1000000).toFixed(1)}M (outside range, 0)`);
-  return 0;
+  // Outside the acceptable range: decay gradually from 50 toward 0 over one
+  // full band-width past the boundary, rather than a hard 0. A near-miss can
+  // still compete on its other factors.
+  const revM = (revenue / 1000000).toFixed(1);
+  if (revenue > config.max) {
+    const score = Math.max(0, Math.round(50 * (1 - (revenue - config.max) / config.max)));
+    signals.push(`Revenue: $${revM}M (above $${(config.max / 1000000).toFixed(1)}M max, decayed ${score})`);
+    return score;
+  }
+
+  const score = Math.max(0, Math.round(50 * (1 - (config.min - revenue) / config.min)));
+  signals.push(`Revenue: $${revM}M (below $${(config.min / 1000000).toFixed(2)}M min, decayed ${score})`);
+  return score;
 }
 
 /**
@@ -112,8 +123,11 @@ function scoreTeamSize(
     return 70;
   }
 
-  signals.push(`Team size: ${employeeCount} (too large >${config.max}, 0)`);
-  return 0;
+  // Above the max: decay gradually from 50 toward 0 over one full max-width
+  // past the boundary, rather than a hard 0.
+  const score = Math.max(0, Math.round(50 * (1 - (employeeCount - config.max) / config.max)));
+  signals.push(`Team size: ${employeeCount} (above ${config.max} max, decayed ${score})`);
+  return score;
 }
 
 /**
