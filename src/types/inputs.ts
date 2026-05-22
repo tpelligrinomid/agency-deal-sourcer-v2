@@ -83,3 +83,32 @@ export const AgencySourcerInputSchema = z.object({
 });
 
 export type AgencySourcerInput = z.infer<typeof AgencySourcerInputSchema>;
+
+// ============================================
+// Single-entity enrich + route ("Quick Add")
+// ============================================
+
+// Ad-hoc flow: enrich one company, or one named person at a company, then
+// stage it for review (Approve → HeyReach). Skips discovery — the domain is
+// supplied directly. The Lovable UI creates the `searches` row and triggers
+// the `enrich-and-route` task with that searchId.
+export const EnrichAndRouteInputSchema = z.object({
+  // The searches row created for this single-entity add
+  searchId: z.string().uuid(),
+
+  // "company" → target the founder/decision-maker, like the batch flow
+  // "person"  → target the specifically named person
+  inputType: z.enum(["company", "person"]),
+
+  // Company domain — required for both (a person is identified by name + domain)
+  domain: z.string(),
+
+  // Person identity — required when inputType === "person"
+  personName: z.string().optional(),
+  personTitle: z.string().optional(),
+
+  // Optional scoring config overrides (same shape as the batch flow)
+  scoringConfig: ScoringConfigSchema,
+});
+
+export type EnrichAndRouteInput = z.infer<typeof EnrichAndRouteInputSchema>;

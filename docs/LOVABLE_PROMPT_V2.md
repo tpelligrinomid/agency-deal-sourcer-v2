@@ -639,3 +639,69 @@ Receives webhooks from HeyReach on connection request accepted. Creates Pipedriv
 11. **Match Aragon Holdings design system exactly**
 12. **Revenue formatting** — `revenue_estimate` stored as number, display as "$1.2M", "$750K"
 13. **Handle progressive data** — cards work at every stage (discovery → enrichment → profiling → scoring → messaging). Use skeletons for pending sections.
+
+---
+
+## V2.1 Addendum — Quick Add (single-entity enrich & route)
+
+Adds an ad-hoc path for enriching **one company** or **one named person** and
+staging it for review, without running a discovery search. Backed by the
+`enrich-and-route` Trigger.dev task.
+
+### Database
+
+Extend the `searches.query_type` CHECK constraint to allow `'single_entity'`:
+
+```sql
+ALTER TABLE searches DROP CONSTRAINT searches_query_type_check;
+ALTER TABLE searches ADD CONSTRAINT searches_query_type_check
+  CHECK (query_type IN ('natural_language', 'domain_lookalike', 'single_entity'));
+```
+
+A single-entity add still creates a normal `searches` row — so it flows through
+the same progress and review UI — it just contains exactly one agency.
+
+### New Search page — add a "Quick Add" tab
+
+Add a third tab to `/search/new` alongside "Natural Language" and
+"Domain Lookalike":
+
+- **"Quick Add"** tab — with a **Company** vs **Person** sub-toggle:
+  - **Company:** one **Domain** input (e.g. `acme.com`)
+  - **Person:** **Full Name** (required), **Company Domain** (required),
+    **Title** (optional)
+- Submit button: "Enrich & Add"
+- On submit:
+  1. Insert a `searches` row with `query_type: 'single_entity'`, and
+     `query_text` = the domain (or `"{name} @ {domain}"` for a person)
+  2. Call the `trigger-search` edge function with
+     `{ searchId, queryType: 'single_entity', inputType: 'company' | 'person',
+        domain, personName?, personTitle? }`
+  3. Navigate to `/search/:id` to watch progress — one agency appears
+
+### `trigger-search` edge function — new branch
+
+When `queryType === 'single_entity'`, trigger the **`enrich-and-route`** task
+instead of `run-agency-sourcer`, passing
+`{ searchId, inputType, domain, personName, personTitle }`.
+
+### Person adds — flagged contacts
+
+For a person add, the task resolves the named person's LinkedIn URL via
+Ocean.io, then Apollo. If neither finds it, the person is **still staged** as a
+contact with `linkedin_url = NULL`. The existing rule already handles this
+correctly: the **Approve button stays disabled until a contact has a LinkedIn
+URL**.
+
+To let the user complete a flagged contact, add an **"Edit Contact"** action to
+the expanded agency detail's Contacts table (a pencil icon per row). It opens
+the same dialog as "Add Contact" but pre-filled — so the user can paste in the
+missing LinkedIn URL before approving. This needs one new `update-search`
+action:
+
+| Action | Payload | DB Operation |
+|--------|---------|-------------|
+| `update_contact` | `contactId, fields{ fullName?, title?, email?, phone?, linkedinUrl?, isFounder?, isCeo?, isOwner? }` | Update the `contacts` row by `id`. On a `linkedin_url`/`email` UNIQUE conflict, surface a clear error ("a contact with that LinkedIn URL already exists"). |
+
+Everything downstream — review, Approve → `approve-agency` → HeyReach, and the
+HeyReach → Pipedrive webhook — is unchanged.

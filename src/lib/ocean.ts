@@ -224,27 +224,35 @@ interface ApolloPerson {
   };
 }
 
-async function searchPeopleApollo(domain: string): Promise<OceanPerson[]> {
+async function searchPeopleApollo(domain: string, name?: string): Promise<OceanPerson[]> {
   const apiKey = process.env.APOLLO_API_KEY;
   if (!apiKey) {
     console.warn("Apollo: APOLLO_API_KEY not configured, skipping fallback");
     return [];
   }
 
-  console.log(`Apollo: searching for founders/C-suite at ${domain}`);
+  console.log(`Apollo: searching ${name ? `for "${name}"` : "for founders/C-suite"} at ${domain}`);
 
   try {
+    // With a name, search by keyword across all seniorities; otherwise fall
+    // back to the founder/owner/C-suite filter.
+    const searchBody: Record<string, any> = {
+      q_organization_domains_list: [domain],
+      per_page: name ? 10 : 5,
+    };
+    if (name) {
+      searchBody.q_keywords = name;
+    } else {
+      searchBody.person_seniorities = ["founder", "owner", "c_suite"];
+    }
+
     const response = await fetch("https://api.apollo.io/api/v1/mixed_people/api_search", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Api-Key": apiKey,
       },
-      body: JSON.stringify({
-        q_organization_domains_list: [domain],
-        person_seniorities: ["founder", "owner", "c_suite"],
-        per_page: 5,
-      }),
+      body: JSON.stringify(searchBody),
     });
 
     if (!response.ok) {
@@ -273,6 +281,108 @@ async function searchPeopleApollo(domain: string): Promise<OceanPerson[]> {
     console.error(`Apollo people search error for ${domain}:`, error);
     return [];
   }
+}
+
+// ============================================
+// Person Lookup by Name (ad-hoc enrich-and-route flow)
+// ============================================
+
+/**
+ * Map an Ocean.io / Apollo person record to the downstream ClayPerson shape.
+ */
+function oceanPersonToClayPerson(p: OceanPerson): ClayPerson {
+  const seniorities = p.seniorities || [];
+  const titleLower = (p.jobTitle || "").toLowerCase();
+
+  return {
+    fullName: p.name || `${p.firstName || ""} ${p.lastName || ""}`.trim(),
+    firstName: p.firstName || null,
+    lastName: p.lastName || null,
+    title: p.jobTitle || null,
+    linkedinUrl: p.linkedinUrl || null,
+    email: null, // email reveal costs credits, skip for now
+    phone: null,
+    isFounder: seniorities.includes("Founder") || titleLower.includes("founder") || titleLower.includes("co-founder"),
+    isCeo: titleLower.includes("ceo") || titleLower.includes("chief executive"),
+    isOwner: seniorities.includes("Owner") || titleLower.includes("owner") || titleLower.includes("principal"),
+  };
+}
+
+/** Normalize a name for loose comparison: lowercase, strip punctuation, collapse spaces. */
+function normalizeName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Loose name match — tolerates middle names, initials, and honorifics
+ * ("Dr. Jane A. Smith" matches "Jane Smith"). Requires the first and last
+ * token of `target` to both appear in `candidate`.
+ */
+export function nameMatches(candidate: string | null | undefined, target: string): boolean {
+  if (!candidate) return false;
+  const c = normalizeName(candidate);
+  const t = normalizeName(target);
+  if (!c || !t) return false;
+  if (c === t) return true;
+
+  const candidateTokens = new Set(c.split(" "));
+  const targetTokens = t.split(" ");
+  if (targetTokens.length >= 2) {
+    return (
+      candidateTokens.has(targetTokens[0]) &&
+      candidateTokens.has(targetTokens[targetTokens.length - 1])
+    );
+  }
+  return candidateTokens.has(targetTokens[0]);
+}
+
+/**
+ * Resolve a specifically-named person at a company domain to a contact
+ * record with (ideally) a LinkedIn URL. Used by the ad-hoc enrich-and-route
+ * flow when the input is "name + company domain".
+ *
+ * Strategy:
+ *   1. Ocean.io people search at the domain → match the name
+ *   2. Apollo fallback → search by name + domain
+ * Returns null if neither source can resolve the person.
+ */
+export async function findPersonByName(
+  domain: string,
+  personName: string
+): Promise<ClayPerson | null> {
+  const apiToken = getApiToken();
+
+  const fullName = (p: OceanPerson) =>
+    p.name || `${p.firstName || ""} ${p.lastName || ""}`.trim();
+
+  // 1. Ocean.io: broad people search at the domain, then match the name.
+  console.log(`Resolving "${personName}" at ${domain} — trying Ocean.io`);
+  const oceanPeople = await fetchPeople(apiToken, {
+    companiesFilters: { includeDomains: [domain] },
+    peoplePerCompany: 25,
+    size: 25,
+  });
+  const oceanMatch = oceanPeople.find((p) => nameMatches(fullName(p), personName));
+  if (oceanMatch) {
+    console.log(`Ocean.io: resolved "${personName}" at ${domain}`);
+    return oceanPersonToClayPerson(oceanMatch);
+  }
+
+  // 2. Apollo fallback: search by name + domain.
+  console.log(`Ocean.io: no match for "${personName}", trying Apollo`);
+  const apolloPeople = await searchPeopleApollo(domain, personName);
+  const apolloMatch = apolloPeople.find((p) => nameMatches(fullName(p), personName));
+  if (apolloMatch) {
+    console.log(`Apollo: resolved "${personName}" at ${domain}`);
+    return oceanPersonToClayPerson(apolloMatch);
+  }
+
+  console.warn(`Could not resolve "${personName}" at ${domain} via Ocean.io or Apollo`);
+  return null;
 }
 
 // ============================================
@@ -354,23 +464,7 @@ export async function enrichWithOcean(
     const linkedinUrl = company.medias?.linkedin?.url || null;
 
     // Map Ocean.io people to ClayPerson format
-    const mappedPeople: ClayPerson[] = people.map((p) => {
-      const seniorities = p.seniorities || [];
-      const titleLower = (p.jobTitle || "").toLowerCase();
-
-      return {
-        fullName: p.name || `${p.firstName || ""} ${p.lastName || ""}`.trim(),
-        firstName: p.firstName || null,
-        lastName: p.lastName || null,
-        title: p.jobTitle || null,
-        linkedinUrl: p.linkedinUrl || null,
-        email: null, // email reveal costs credits, skip for now
-        phone: null,
-        isFounder: seniorities.includes("Founder") || titleLower.includes("founder") || titleLower.includes("co-founder"),
-        isCeo: titleLower.includes("ceo") || titleLower.includes("chief executive"),
-        isOwner: seniorities.includes("Owner") || titleLower.includes("owner") || titleLower.includes("principal"),
-      };
-    });
+    const mappedPeople: ClayPerson[] = people.map(oceanPersonToClayPerson);
 
     // Combine industries
     const industry = company.linkedinIndustry

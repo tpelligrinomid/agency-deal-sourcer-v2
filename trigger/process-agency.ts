@@ -6,7 +6,7 @@ import type {
   ClayPerson,
 } from "../src/types/prospects";
 import type { ScoringConfig } from "../src/types/inputs";
-import { enrichWithOcean } from "../src/lib/ocean";
+import { enrichWithOcean, findPersonByName, nameMatches } from "../src/lib/ocean";
 import { scrapeAgencyWebsite } from "../src/lib/firecrawl";
 import { generateAgencyProfile, generatePersonalizedMessages } from "../src/lib/claude";
 import { scoreAgency } from "../src/lib/scoring";
@@ -21,6 +21,13 @@ import {
 export interface ProcessAgencyInput {
   agency: EnrichedAgency;
   scoringConfig?: ScoringConfig;
+  // Ad-hoc enrich-and-route flow: when set, ensure this specific person is in
+  // the contact set and use them as the outreach target.
+  targetPersonName?: string;
+  targetPersonTitle?: string;
+  // Generate the outreach message even for low-fit agencies — ad-hoc adds are
+  // deliberately chosen, so they always get a message.
+  forceMessage?: boolean;
 }
 
 export interface ProcessAgencyOutput {
@@ -39,6 +46,62 @@ export interface ProcessAgencyOutput {
     email: string | null;
   }[];
   agencyProfile: AgencyProfile | null;
+}
+
+/**
+ * Build a placeholder contact from a user-supplied name/title when the person
+ * can't be resolved to a real profile. Staged so the user can fill in the
+ * LinkedIn URL during review before approving.
+ */
+function makePersonStub(name: string, title?: string | null): ClayPerson {
+  const parts = name.trim().split(/\s+/);
+  const t = (title || "").toLowerCase();
+  return {
+    fullName: name.trim(),
+    firstName: parts[0] || null,
+    lastName: parts.length > 1 ? parts.slice(1).join(" ") : null,
+    title: title || null,
+    linkedinUrl: null,
+    email: null,
+    phone: null,
+    isFounder: t.includes("founder"),
+    isCeo: t.includes("ceo") || t.includes("chief executive"),
+    isOwner: t.includes("owner") || t.includes("principal"),
+  };
+}
+
+/**
+ * Upsert people as contacts for an agency and return the review-output rows.
+ */
+async function stageContacts(
+  agencyId: string,
+  people: ClayPerson[]
+): Promise<ProcessAgencyOutput["contacts"]> {
+  if (people.length === 0) return [];
+
+  const inserts = people.map((person) => ({
+    fullName: person.fullName,
+    firstName: person.firstName,
+    lastName: person.lastName,
+    title: person.title,
+    email: person.email,
+    phone: person.phone,
+    linkedinUrl: person.linkedinUrl,
+    isFounder: person.isFounder,
+    isCeo: person.isCeo,
+    isOwner: person.isOwner,
+  }));
+
+  const ids = await upsertContacts(agencyId, inserts);
+  return ids.map((contactId, i) => ({
+    contactId,
+    fullName: inserts[i].fullName,
+    firstName: inserts[i].firstName,
+    lastName: inserts[i].lastName,
+    title: inserts[i].title,
+    linkedinUrl: inserts[i].linkedinUrl,
+    email: inserts[i].email,
+  }));
 }
 
 /**
@@ -61,7 +124,7 @@ export const processAgency = task({
     factor: 2,
   },
   run: async (payload: ProcessAgencyInput): Promise<ProcessAgencyOutput> => {
-    const { agency, scoringConfig } = payload;
+    const { agency, scoringConfig, targetPersonName, targetPersonTitle, forceMessage } = payload;
     const contactRows: ProcessAgencyOutput["contacts"] = [];
 
     // ── Step 1: Enrich ──────────────────────────────────────────────
@@ -101,6 +164,21 @@ export const processAgency = task({
       agency.revenueEstimate = enrichmentData.revenueEstimate;
       agency.contacts = enrichmentData.people || [];
 
+      // Ad-hoc person flow: make sure the specifically-named person is in the
+      // contact set, even if Ocean's founder/C-suite search missed them.
+      if (targetPersonName) {
+        const people = enrichmentData.people || [];
+        const alreadyPresent = people.some((p) => nameMatches(p.fullName, targetPersonName));
+        if (!alreadyPresent) {
+          console.log(`${agency.domain}: "${targetPersonName}" not in enrichment — resolving directly`);
+          const resolved = await findPersonByName(agency.domain, targetPersonName);
+          // Resolved person, or a stub flagged for manual LinkedIn URL entry.
+          people.unshift(resolved || makePersonStub(targetPersonName, targetPersonTitle));
+          enrichmentData.people = people;
+          agency.contacts = people;
+        }
+      }
+
       await updateAgencyEnrichment(agency.id, "complete", enrichmentData as any, {
         companyName: agency.companyName,
         description: agency.description,
@@ -116,35 +194,20 @@ export const processAgency = task({
 
       // Upsert contacts
       if (enrichmentData.people && enrichmentData.people.length > 0) {
-        const contactInserts = enrichmentData.people.map((person) => ({
-          fullName: person.fullName,
-          firstName: person.firstName,
-          lastName: person.lastName,
-          title: person.title,
-          email: person.email,
-          phone: person.phone,
-          linkedinUrl: person.linkedinUrl,
-          isFounder: person.isFounder,
-          isCeo: person.isCeo,
-          isOwner: person.isOwner,
-        }));
-
-        const contactIds = await upsertContacts(agency.id, contactInserts);
-        for (let ci = 0; ci < contactIds.length; ci++) {
-          contactRows.push({
-            contactId: contactIds[ci],
-            fullName: contactInserts[ci].fullName,
-            firstName: contactInserts[ci].firstName,
-            lastName: contactInserts[ci].lastName,
-            title: contactInserts[ci].title,
-            linkedinUrl: contactInserts[ci].linkedinUrl,
-            email: contactInserts[ci].email,
-          });
-        }
+        contactRows.push(...(await stageContacts(agency.id, enrichmentData.people)));
       }
     } else {
       agency.enrichmentStatus = "failed";
       await updateAgencyEnrichment(agency.id, "failed");
+
+      // Ad-hoc person flow: even when company enrichment fails entirely, still
+      // stage the named person so the user can review and complete them.
+      if (targetPersonName) {
+        const resolved = await findPersonByName(agency.domain, targetPersonName);
+        const person = resolved || makePersonStub(targetPersonName, targetPersonTitle);
+        contactRows.push(...(await stageContacts(agency.id, [person])));
+        agency.contacts = [person];
+      }
     }
 
     // ── Step 2: Profile ─────────────────────────────────────────────
@@ -184,12 +247,19 @@ export const processAgency = task({
       scored.scoringSignals
     );
 
-    // ── Step 4: Generate messages (qualified only) ──────────────────
-    if (scored.fitLevel === "high" || scored.fitLevel === "medium") {
+    // ── Step 4: Generate messages ───────────────────────────────────
+    // Qualified (high/medium) agencies, or any agency in the ad-hoc flow
+    // (forceMessage) — those are deliberately chosen and always get a message.
+    if (scored.fitLevel !== "low" || forceMessage) {
       const titleMatch = (title: string | null, keyword: string) =>
         (title || "").toLowerCase().includes(keyword);
 
+      // Ad-hoc person flow targets the named person; otherwise the most senior
+      // decision-maker by title.
       const targetContact =
+        (targetPersonName
+          ? contactRows.find((c) => nameMatches(c.fullName, targetPersonName))
+          : undefined) ||
         contactRows.find(
           (c) =>
             titleMatch(c.title, "founder") ||
@@ -198,7 +268,8 @@ export const processAgency = task({
             titleMatch(c.title, "principal") ||
             titleMatch(c.title, "president") ||
             titleMatch(c.title, "managing director")
-        ) || contactRows[0];
+        ) ||
+        contactRows[0];
 
       if (targetContact && agency.agencyProfile) {
         try {
