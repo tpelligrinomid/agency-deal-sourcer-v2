@@ -114,16 +114,45 @@ export async function markSearchFailed(
 // Agency CRUD (replaces Prospect CRUD)
 // ============================================
 
+/**
+ * Upsert agencies and return a domain → id map.
+ *
+ * Each agency is upserted in its own edge-function call so the returned id is
+ * unambiguously paired with its domain. A batch call returns a bare id array
+ * whose length can differ from the input when two domains collapse on the
+ * ON CONFLICT(domain) upsert — pairing those by array index silently crosses
+ * agency identities (one company's data written onto another's row).
+ */
 export async function upsertAgencies(
   searchId: string,
   agencies: RawProspect[]
-): Promise<string[]> {
-  const result = await callEdgeFunction<{ ids: string[] }>("upsert_agencies", {
-    searchId,
-    agencies,
-  });
+): Promise<Map<string, string>> {
+  const domainToId = new Map<string, string>();
+  const concurrency = 10;
 
-  return result.ids || [];
+  for (let i = 0; i < agencies.length; i += concurrency) {
+    const chunk = agencies.slice(i, i + concurrency);
+    const results = await Promise.all(
+      chunk.map(async (agency) => {
+        try {
+          const result = await callEdgeFunction<{ ids: string[] }>("upsert_agencies", {
+            searchId,
+            agencies: [agency],
+          });
+          return { domain: agency.domain, id: result.ids?.[0] };
+        } catch (error) {
+          console.error(`upsert_agencies failed for ${agency.domain}:`, error);
+          return { domain: agency.domain, id: undefined as string | undefined };
+        }
+      })
+    );
+    for (const { domain, id } of results) {
+      if (id) domainToId.set(domain, id);
+      else console.warn(`upsert_agencies returned no id for ${domain} — agency skipped`);
+    }
+  }
+
+  return domainToId;
 }
 
 export async function updateAgencyEnrichment(

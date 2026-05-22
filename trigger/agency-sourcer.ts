@@ -84,7 +84,7 @@ export const runAgencySourcer = task({
               exaDescription: null,
               exaHighlights: null,
               exaScore: null,
-              preEnriched: undefined,
+              preEnriched: null,
             });
           }
         }
@@ -179,10 +179,11 @@ export const runAgencySourcer = task({
       // ==========================================
       await updateSearchStatus(searchId, "discovering", "Saving discovered agencies...", 20);
 
-      // 4a. Insert new agencies
-      const newAgencyIds = finalNewProspects.length > 0
+      // 4a. Insert new agencies — returns a domain→id map so ids are paired
+      // to prospects by domain, never by array index.
+      const newAgencyMap = finalNewProspects.length > 0
         ? await upsertAgencies(searchId, finalNewProspects)
-        : [];
+        : new Map<string, string>();
 
       // 4b. Rediscover skipped agencies
       const rediscoveredIds: string[] = [];
@@ -193,6 +194,7 @@ export const runAgencySourcer = task({
       }
 
       // 4c. Insert search_agencies junction rows
+      const newAgencyIds = [...new Set(newAgencyMap.values())];
       if (newAgencyIds.length > 0) {
         await insertSearchAgencies(searchId, newAgencyIds, false);
       }
@@ -205,30 +207,42 @@ export const runAgencySourcer = task({
       console.log(`Saved ${totalAgencies} agencies (${newAgencyIds.length} new, ${rediscoveredIds.length} rediscovered)`);
 
       // 4d. Build enrichedAgencies array
+      //   New agencies: one per distinct domain, id looked up by domain — a
+      //   domain that collapsed on upsert can never be paired with a wrong id.
+      const prospectByDomain = new Map<string, RawProspect>();
+      for (const p of finalNewProspects) prospectByDomain.set(p.domain, p);
+
+      const newEnrichedAgencies: EnrichedAgency[] = [];
+      for (const [domain, p] of prospectByDomain) {
+        const id = newAgencyMap.get(domain);
+        if (!id) {
+          console.warn(`No agency id for ${domain} — excluded from processing`);
+          continue;
+        }
+        const pre = p.preEnriched;
+        newEnrichedAgencies.push({
+          id,
+          domain,
+          isRediscovery: false,
+          companyName: pre?.companyName || p.companyName,
+          description: pre?.description || null,
+          industry: pre?.industry || null,
+          employeeCount: pre?.employeeCount || null,
+          foundedYear: pre?.foundedYear || null,
+          location: pre?.location || null,
+          linkedinUrl: pre?.linkedinUrl || null,
+          technologies: pre?.technologies || null,
+          services: pre?.services || null,
+          revenueEstimate: pre?.revenueEstimate || null,
+          enrichmentStatus: pre ? "complete" as const : "pending" as const,
+          enrichmentData: pre || null,
+          agencyProfile: null,
+          contacts: [],
+        });
+      }
+
       const enrichedAgencies: EnrichedAgency[] = [
-        // New agencies
-        ...finalNewProspects.map((p, i) => {
-          const pre = p.preEnriched;
-          return {
-            id: newAgencyIds[i],
-            domain: p.domain,
-            isRediscovery: false,
-            companyName: pre?.companyName || p.companyName,
-            description: pre?.description || null,
-            industry: pre?.industry || null,
-            employeeCount: pre?.employeeCount || null,
-            foundedYear: pre?.foundedYear || null,
-            location: pre?.location || null,
-            linkedinUrl: pre?.linkedinUrl || null,
-            technologies: pre?.technologies || null,
-            services: pre?.services || null,
-            revenueEstimate: pre?.revenueEstimate || null,
-            enrichmentStatus: pre ? "complete" as const : "pending" as const,
-            enrichmentData: pre || null,
-            agencyProfile: null,
-            contacts: [],
-          };
-        }),
+        ...newEnrichedAgencies,
         // Rediscovered agencies (cleared enrichment, need full re-enrichment)
         ...finalRediscoveries.map((p, i) => ({
           id: rediscoveredIds[i],
